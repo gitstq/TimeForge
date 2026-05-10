@@ -1,671 +1,410 @@
-"""Command-line interface for TimeForge.
-
-Provides the main CLI entry point using argparse with subcommands for
-time tracking, pomodoro timer, report generation, analytics, and
-git integration.
+#!/usr/bin/env python3
+"""
+TimeForge CLI - 命令行入口
 """
 
 import argparse
 import sys
-from typing import List, Optional
+import signal
+from typing import Optional
 
-from . import __version__
-from .core.tracker import TimeTracker
-from .core.storage import Storage
-from .features.pomodoro import PomodoroTimer
-from .features.report import ReportGenerator
-from .features.analytics import AnalyticsEngine
-from .features.gitlink import GitLinker
-from .utils.display import Display, Colors
-from .utils.config import Config
+from .core import (
+    TimeFormatter, TimerConfig, TimerType, TimerSession,
+    ConfigManager, SessionManager
+)
+from .timer import CountdownTimer, StopwatchTimer, PomodoroTimer
+from .display import TimerDisplay
+from .sound import SoundManager
+from .stats import StatsManager
+
+# Rich库检测
+try:
+    from rich.live import Live
+    RICH_AVAILABLE = True
+except ImportError:
+    RICH_AVAILABLE = False
+
+
+class TimeForgeCLI:
+    """TimeForge命令行接口"""
+    
+    def __init__(self):
+        self.config_manager = ConfigManager()
+        self.session_manager = SessionManager()
+        self.display = TimerDisplay(use_rich=True)
+        self.sound = SoundManager(self.config_manager.config.sound_enabled)
+        self.running = False
+    
+    def countdown(self, duration_str: str, title: str = "倒计时"):
+        """运行倒计时"""
+        try:
+            duration = TimeFormatter.parse_time_input(duration_str)
+        except ValueError as e:
+            self.display.print_error(f"无效的时间格式: {duration_str}")
+            return
+        
+        if duration <= 0:
+            self.display.print_error("时长必须大于0")
+            return
+        
+        timer = CountdownTimer(duration, self.config_manager.config, title)
+        self._run_timer(timer, TimerType.COUNTDOWN)
+    
+    def stopwatch(self, title: str = "秒表"):
+        """运行秒表"""
+        timer = StopwatchTimer(self.config_manager.config, title)
+        self._run_timer(timer, TimerType.STOPWATCH)
+    
+    def pomodoro(self, work_duration: Optional[int] = None):
+        """运行番茄钟"""
+        config = self.config_manager.config
+        if work_duration:
+            config.work_duration = work_duration
+        
+        timer = PomodoroTimer(config)
+        self._run_timer(timer, TimerType.POMODORO)
+    
+    def _run_timer(self, timer, timer_type: TimerType):
+        """运行计时器"""
+        self.running = True
+        
+        # 设置信号处理
+        def signal_handler(sig, frame):
+            self.running = False
+            timer.stop()
+            print("\n")
+            sys.exit(0)
+        
+        signal.signal(signal.SIGINT, signal_handler)
+        
+        # 设置回调
+        timer.on('on_finish', lambda t: self._on_timer_finish(t))
+        
+        # 显示初始界面
+        self.display.clear_screen()
+        
+        if RICH_AVAILABLE and self.display.use_rich:
+            self._run_with_rich(timer, timer_type)
+        else:
+            self._run_simple(timer, timer_type)
+    
+    def _run_with_rich(self, timer, timer_type: TimerType):
+        """使用Rich运行计时器"""
+        from rich.live import Live
+        
+        def generate_display():
+            if timer_type == TimerType.STOPWATCH:
+                return self.display.render_timer(
+                    elapsed=timer.elapsed,
+                    timer_type=timer_type,
+                    title=getattr(timer, 'title', '秒表'),
+                    state=timer.state
+                )
+            else:
+                return self.display.render_timer(
+                    elapsed=timer.elapsed,
+                    remaining=getattr(timer, 'remaining', 0),
+                    duration=getattr(timer, 'duration', 0),
+                    timer_type=timer_type,
+                    title=getattr(timer, 'title', ''),
+                    state=timer.state,
+                    progress=getattr(timer, 'progress', 0)
+                )
+        
+        timer.start()
+        
+        try:
+            with Live(generate_display(), console=self.display.console, refresh_per_second=4) as live:
+                while timer.state.value in ('running', 'paused'):
+                    live.update(generate_display())
+                    import time
+                    time.sleep(0.25)
+        except Exception:
+            pass
+        
+        # 保存会话
+        if hasattr(timer, 'get_session'):
+            self.session_manager.add(timer.get_session())
+        
+        # 播放完成声音
+        self.sound.play_finish()
+        
+        # 显示完成信息
+        self.display.print_success("\n⏰ 计时完成!")
+    
+    def _run_simple(self, timer, timer_type: TimerType):
+        """简单模式运行计时器"""
+        import time
+        
+        timer.start()
+        
+        try:
+            while timer.state.value in ('running', 'paused'):
+                if timer_type == TimerType.STOPWATCH:
+                    print(f"\r⏱️  {TimeFormatter.format_seconds(timer.elapsed)}", end="", flush=True)
+                else:
+                    remaining = getattr(timer, 'remaining', 0)
+                    print(f"\r⏳ 剩余: {TimeFormatter.format_seconds(remaining)}", end="", flush=True)
+                time.sleep(0.1)
+        except KeyboardInterrupt:
+            timer.stop()
+        
+        print("\n")
+        
+        # 保存会话
+        if hasattr(timer, 'get_session'):
+            self.session_manager.add(timer.get_session())
+        
+        # 播放完成声音
+        self.sound.play_finish()
+        
+        print("⏰ 计时完成!")
+    
+    def _on_timer_finish(self, timer):
+        """计时器完成回调"""
+        self.running = False
+        self.sound.play_finish()
+    
+    def show_stats(self):
+        """显示统计信息"""
+        stats_manager = StatsManager(self.session_manager.sessions)
+        
+        if not self.session_manager.sessions:
+            self.display.print_warning("暂无统计数据，开始使用TimeForge来记录你的时间吧！")
+            return
+        
+        self.display.print(stats_manager.get_summary())
+    
+    def config_cmd(self, **kwargs):
+        """配置命令"""
+        if not kwargs:
+            # 显示当前配置
+            config = self.config_manager.config
+            print("\n⚙️ 当前配置:")
+            print(f"  工作时长: {config.work_duration} 分钟")
+            print(f"  短休息: {config.short_break} 分钟")
+            print(f"  长休息: {config.long_break} 分钟")
+            print(f"  长休息前会话数: {config.sessions_before_long}")
+            print(f"  声音: {'开启' if config.sound_enabled else '关闭'}")
+            print(f"  自动开始休息: {'是' if config.auto_start_break else '否'}")
+            print(f"  自动开始工作: {'是' if config.auto_start_work else '否'}")
+            return
+        
+        # 更新配置
+        self.config_manager.update(**kwargs)
+        self.display.print_success("配置已更新!")
+    
+    def clear_stats(self):
+        """清空统计数据"""
+        self.session_manager.clear()
+        self.display.print_success("统计数据已清空!")
 
 
 def create_parser() -> argparse.ArgumentParser:
-    """Create and configure the argument parser for TimeForge CLI.
-
-    Sets up all subcommands and their arguments:
-    - start, stop, pause, resume, status, log, list, delete, edit
-    - pomo (start, stop, status, config)
-    - report (daily, weekly, monthly)
-    - analyze
-    - git (link, log)
-    - config
-
-    Returns:
-        Configured ArgumentParser instance.
-    """
+    """创建命令行参数解析器"""
     parser = argparse.ArgumentParser(
         prog="timeforge",
-        description="TimeForge - Lightweight terminal time tracking "
-                    "and productivity analysis tool.",
-        epilog="Use 'timeforge <command> --help' for more information "
-               "on a specific command.",
+        description="⏰ TimeForge - 终端时间管理工具",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+  timeforge countdown 10m           # 10分钟倒计时
+  timeforge countdown 1h30m         # 1小时30分钟倒计时
+  timeforge countdown 90            # 90秒倒计时
+  timeforge countdown 5:00          # 5分钟倒计时
+  timeforge stopwatch               # 启动秒表
+  timeforge pomodoro                # 启动番茄钟
+  timeforge pomodoro -w 30          # 30分钟工作时间的番茄钟
+  timeforge stats                   # 显示统计
+  timeforge config                  # 显示当前配置
+  timeforge config -w 30 -s 10      # 设置工作30分钟，短休息10分钟
+        """
     )
+    
     parser.add_argument(
         "-v", "--version",
         action="version",
-        version=f"TimeForge v{__version__}",
+        version="%(prog)s 1.0.0"
     )
-
-    subparsers = parser.add_subparsers(
-        dest="command",
-        help="Available commands",
+    
+    parser.add_argument(
+        "--no-sound",
+        action="store_true",
+        help="禁用声音提示"
     )
-
-    # ── start command ─────────────────────────────────────────────────
-    start_parser = subparsers.add_parser(
-        "start",
-        help="Start tracking time for a project",
+    
+    parser.add_argument(
+        "--no-rich",
+        action="store_true",
+        help="禁用Rich显示(使用简单文本模式)"
     )
-    start_parser.add_argument(
-        "project",
-        help="Project name to track",
+    
+    subparsers = parser.add_subparsers(dest="command", help="可用命令")
+    
+    # 倒计时命令
+    countdown_parser = subparsers.add_parser(
+        "countdown", 
+        help="启动倒计时",
+        description="启动一个倒计时器"
     )
-    start_parser.add_argument(
-        "description",
-        nargs="?",
-        default="",
-        help="Description of the work (optional)",
-    )
-
-    # ── stop command ──────────────────────────────────────────────────
-    subparsers.add_parser(
-        "stop",
-        help="Stop the current tracking session",
-    )
-
-    # ── pause command ─────────────────────────────────────────────────
-    subparsers.add_parser(
-        "pause",
-        help="Pause the current tracking session",
-    )
-
-    # ── resume command ────────────────────────────────────────────────
-    subparsers.add_parser(
-        "resume",
-        help="Resume a paused tracking session",
-    )
-
-    # ── status command ────────────────────────────────────────────────
-    subparsers.add_parser(
-        "status",
-        help="Show current tracking status",
-    )
-
-    # ── log command ───────────────────────────────────────────────────
-    log_parser = subparsers.add_parser(
-        "log",
-        help="View time log for a date",
-    )
-    log_parser.add_argument(
-        "date",
-        nargs="?",
-        default=None,
-        help="Date in YYYY-MM-DD format (default: today)",
-    )
-
-    # ── list command ──────────────────────────────────────────────────
-    subparsers.add_parser(
-        "list",
-        help="List all projects",
-    )
-
-    # ── delete command ────────────────────────────────────────────────
-    delete_parser = subparsers.add_parser(
-        "delete",
-        help="Delete a time entry",
-    )
-    delete_parser.add_argument(
-        "id",
-        help="Entry ID to delete",
-    )
-
-    # ── edit command ──────────────────────────────────────────────────
-    edit_parser = subparsers.add_parser(
-        "edit",
-        help="Edit a time entry",
-    )
-    edit_parser.add_argument(
-        "id",
-        help="Entry ID to edit",
-    )
-    edit_parser.add_argument(
-        "--project", "-p",
-        default=None,
-        help="New project name",
-    )
-    edit_parser.add_argument(
-        "--description", "-d",
-        default=None,
-        help="New description",
-    )
-    edit_parser.add_argument(
-        "--start",
-        default=None,
-        help="New start time (ISO format)",
-    )
-    edit_parser.add_argument(
-        "--end",
-        default=None,
-        help="New end time (ISO format)",
-    )
-
-    # ── pomo (pomodoro) command ───────────────────────────────────────
-    pomo_parser = subparsers.add_parser(
-        "pomo",
-        help="Pomodoro timer commands",
-    )
-    pomo_subparsers = pomo_parser.add_subparsers(
-        dest="pomo_command",
-        help="Pomodoro subcommands",
-    )
-
-    pomo_start = pomo_subparsers.add_parser(
-        "start",
-        help="Start a pomodoro work session",
-    )
-    pomo_start.add_argument(
+    countdown_parser.add_argument(
         "duration",
-        nargs="?",
+        help="倒计时时长 (如: 10m, 1h, 90s, 5:00, 1:30:00)"
+    )
+    countdown_parser.add_argument(
+        "-t", "--title",
+        default="倒计时",
+        help="计时器标题"
+    )
+    
+    # 秒表命令
+    stopwatch_parser = subparsers.add_parser(
+        "stopwatch",
+        help="启动秒表",
+        description="启动一个秒表计时器"
+    )
+    stopwatch_parser.add_argument(
+        "-t", "--title",
+        default="秒表",
+        help="计时器标题"
+    )
+    
+    # 番茄钟命令
+    pomodoro_parser = subparsers.add_parser(
+        "pomodoro",
+        help="启动番茄钟",
+        description="启动番茄钟计时器"
+    )
+    pomodoro_parser.add_argument(
+        "-w", "--work",
         type=int,
-        default=None,
-        help="Work duration in minutes (default: 25)",
+        metavar="MINUTES",
+        help="工作时间(分钟)"
     )
-
-    pomo_subparsers.add_parser(
-        "stop",
-        help="Stop the current pomodoro session",
-    )
-
-    pomo_subparsers.add_parser(
-        "status",
-        help="Show pomodoro timer status",
-    )
-
-    pomo_subparsers.add_parser(
-        "config",
-        help="Show pomodoro configuration",
-    )
-
-    # ── report command ────────────────────────────────────────────────
-    report_parser = subparsers.add_parser(
-        "report",
-        help="Generate time tracking reports",
-    )
-    report_parser.add_argument(
-        "period",
-        nargs="?",
-        default="daily",
-        choices=["daily", "weekly", "monthly"],
-        help="Report period (default: daily)",
-    )
-    report_parser.add_argument(
-        "--format", "-f",
-        default="markdown",
-        choices=["json", "csv", "html", "markdown"],
-        help="Output format (default: markdown)",
-    )
-    report_parser.add_argument(
-        "--project", "-p",
-        default=None,
-        help="Filter by project name",
-    )
-    report_parser.add_argument(
-        "--from",
-        dest="from_date",
-        default=None,
-        help="Start date in YYYY-MM-DD format",
-    )
-    report_parser.add_argument(
-        "--to",
-        dest="to_date",
-        default=None,
-        help="End date in YYYY-MM-DD format",
-    )
-    report_parser.add_argument(
-        "--output", "-o",
-        default=None,
-        help="Output file path (default: stdout)",
-    )
-
-    # ── analyze command ───────────────────────────────────────────────
-    analyze_parser = subparsers.add_parser(
-        "analyze",
-        help="Run productivity analysis",
-    )
-    analyze_parser.add_argument(
-        "--days", "-d",
+    pomodoro_parser.add_argument(
+        "-s", "--short-break",
         type=int,
-        default=30,
-        help="Number of days to analyze (default: 30)",
+        metavar="MINUTES",
+        help="短休息时间(分钟)"
     )
-
-    # ── git command ───────────────────────────────────────────────────
-    git_parser = subparsers.add_parser(
-        "git",
-        help="Git integration commands",
+    pomodoro_parser.add_argument(
+        "-l", "--long-break",
+        type=int,
+        metavar="MINUTES",
+        help="长休息时间(分钟)"
     )
-    git_subparsers = git_parser.add_subparsers(
-        dest="git_command",
-        help="Git subcommands",
+    
+    # 统计命令
+    stats_parser = subparsers.add_parser(
+        "stats",
+        help="显示时间统计",
+        description="显示使用统计信息"
     )
-
-    git_link = git_subparsers.add_parser(
-        "link",
-        help="Link latest git commit to current time entry",
+    stats_parser.add_argument(
+        "--clear",
+        action="store_true",
+        help="清空统计数据"
     )
-    git_link.add_argument(
-        "--entry", "-e",
-        default=None,
-        help="Specific entry ID to link (default: active or latest)",
-    )
-
-    git_subparsers.add_parser(
-        "log",
-        help="Show git log with time tracking info",
-    )
-
-    # ── config command ────────────────────────────────────────────────
+    
+    # 配置命令
     config_parser = subparsers.add_parser(
         "config",
-        help="View or modify configuration",
+        help="配置TimeForge",
+        description="查看或修改配置"
     )
     config_parser.add_argument(
-        "key",
-        nargs="?",
-        default=None,
-        help="Configuration key to view or set",
+        "-w", "--work",
+        type=int,
+        metavar="MINUTES",
+        help="设置工作时间(分钟)"
     )
     config_parser.add_argument(
-        "value",
-        nargs="?",
-        default=None,
-        help="New value for the configuration key",
+        "-s", "--short-break",
+        type=int,
+        metavar="MINUTES",
+        help="设置短休息时间(分钟)"
     )
     config_parser.add_argument(
-        "--reset",
-        action="store_true",
-        help="Reset configuration to defaults",
+        "-l", "--long-break",
+        type=int,
+        metavar="MINUTES",
+        help="设置长休息时间(分钟)"
     )
     config_parser.add_argument(
-        "--list",
-        action="store_true",
-        dest="list_all",
-        help="List all configuration values",
+        "--sound",
+        type=lambda x: x.lower() in ('true', 'yes', '1', 'on'),
+        metavar="ON/OFF",
+        help="启用/禁用声音 (true/false)"
     )
-
+    config_parser.add_argument(
+        "--auto-break",
+        type=lambda x: x.lower() in ('true', 'yes', '1', 'on'),
+        metavar="ON/OFF",
+        help="自动开始休息"
+    )
+    
     return parser
 
 
-def main(argv: Optional[List[str]] = None) -> int:
-    """Main CLI entry point for TimeForge.
-
-    Parses command-line arguments and dispatches to the appropriate
-    handler function.
-
-    Args:
-        argv: Command-line arguments. Defaults to sys.argv[1:].
-
-    Returns:
-        Exit code (0 for success, non-zero for errors).
-    """
+def main():
+    """主入口"""
     parser = create_parser()
-    args = parser.parse_args(argv)
-
+    args = parser.parse_args()
+    
     if not args.command:
         parser.print_help()
-        return 0
-
-    display = Display()
-
-    try:
-        if args.command == "start":
-            return _cmd_start(args, display)
-        elif args.command == "stop":
-            return _cmd_stop(display)
-        elif args.command == "pause":
-            return _cmd_pause(display)
-        elif args.command == "resume":
-            return _cmd_resume(display)
-        elif args.command == "status":
-            return _cmd_status(display)
-        elif args.command == "log":
-            return _cmd_log(args, display)
-        elif args.command == "list":
-            return _cmd_list(display)
-        elif args.command == "delete":
-            return _cmd_delete(args, display)
-        elif args.command == "edit":
-            return _cmd_edit(args, display)
-        elif args.command == "pomo":
-            return _cmd_pomo(args, display)
-        elif args.command == "report":
-            return _cmd_report(args, display)
-        elif args.command == "analyze":
-            return _cmd_analyze(args, display)
-        elif args.command == "git":
-            return _cmd_git(args, display)
-        elif args.command == "config":
-            return _cmd_config(args, display)
+        return
+    
+    cli = TimeForgeCLI()
+    
+    # 处理全局选项
+    if args.no_sound:
+        cli.sound.disable()
+    if args.no_rich:
+        cli.display.use_rich = False
+    
+    # 执行命令
+    if args.command == "countdown":
+        cli.countdown(args.duration, args.title)
+    
+    elif args.command == "stopwatch":
+        cli.stopwatch(args.title)
+    
+    elif args.command == "pomodoro":
+        config_kwargs = {}
+        if args.work:
+            config_kwargs['work_duration'] = args.work
+        if args.short_break:
+            config_kwargs['short_break'] = args.short_break
+        if args.long_break:
+            config_kwargs['long_break'] = args.long_break
+        
+        if config_kwargs:
+            cli.config_manager.update(**config_kwargs)
+        
+        cli.pomodoro(args.work)
+    
+    elif args.command == "stats":
+        if hasattr(args, 'clear') and args.clear:
+            cli.clear_stats()
         else:
-            parser.print_help()
-            return 1
-
-    except KeyboardInterrupt:
-        display._print()
-        display.warning("Operation cancelled.")
-        return 130
-    except Exception as e:
-        display.error(f"Error: {e}")
-        return 1
-
-
-def _cmd_start(args: argparse.Namespace, display: Display) -> int:
-    """Handle the 'start' command.
-
-    Args:
-        args: Parsed command-line arguments.
-        display: Display utility instance.
-
-    Returns:
-        Exit code.
-    """
-    tracker = TimeTracker()
-    tracker.start(args.project, args.description)
-    return 0
-
-
-def _cmd_stop(display: Display) -> int:
-    """Handle the 'stop' command.
-
-    Args:
-        display: Display utility instance.
-
-    Returns:
-        Exit code.
-    """
-    tracker = TimeTracker()
-    tracker.stop()
-    return 0
-
-
-def _cmd_pause(display: Display) -> int:
-    """Handle the 'pause' command.
-
-    Args:
-        display: Display utility instance.
-
-    Returns:
-        Exit code.
-    """
-    tracker = TimeTracker()
-    tracker.pause()
-    return 0
-
-
-def _cmd_resume(display: Display) -> int:
-    """Handle the 'resume' command.
-
-    Args:
-        display: Display utility instance.
-
-    Returns:
-        Exit code.
-    """
-    tracker = TimeTracker()
-    tracker.resume()
-    return 0
-
-
-def _cmd_status(display: Display) -> int:
-    """Handle the 'status' command.
-
-    Args:
-        display: Display utility instance.
-
-    Returns:
-        Exit code.
-    """
-    tracker = TimeTracker()
-    tracker.status()
-    return 0
-
-
-def _cmd_log(args: argparse.Namespace, display: Display) -> int:
-    """Handle the 'log' command.
-
-    Args:
-        args: Parsed command-line arguments.
-        display: Display utility instance.
-
-    Returns:
-        Exit code.
-    """
-    tracker = TimeTracker()
-    tracker.log(args.date)
-    return 0
-
-
-def _cmd_list(display: Display) -> int:
-    """Handle the 'list' command.
-
-    Args:
-        display: Display utility instance.
-
-    Returns:
-        Exit code.
-    """
-    tracker = TimeTracker()
-    tracker.list_projects()
-    return 0
-
-
-def _cmd_delete(args: argparse.Namespace, display: Display) -> int:
-    """Handle the 'delete' command.
-
-    Args:
-        args: Parsed command-line arguments.
-        display: Display utility instance.
-
-    Returns:
-        Exit code.
-    """
-    tracker = TimeTracker()
-    if tracker.delete_entry(args.id):
-        return 0
-    return 1
-
-
-def _cmd_edit(args: argparse.Namespace, display: Display) -> int:
-    """Handle the 'edit' command.
-
-    Args:
-        args: Parsed command-line arguments.
-        display: Display utility instance.
-
-    Returns:
-        Exit code.
-    """
-    tracker = TimeTracker()
-    if tracker.edit_entry(
-        entry_id=args.id,
-        project=args.project,
-        description=args.description,
-        start_time=args.start,
-        end_time=args.end,
-    ):
-        return 0
-    return 1
-
-
-def _cmd_pomo(args: argparse.Namespace, display: Display) -> int:
-    """Handle the 'pomo' command.
-
-    Args:
-        args: Parsed command-line arguments.
-        display: Display utility instance.
-
-    Returns:
-        Exit code.
-    """
-    pomo = PomodoroTimer()
-
-    if not args.pomo_command:
-        display.info("Usage: timeforge pomo <start|stop|status|config>")
-        return 1
-
-    if args.pomo_command == "start":
-        pomo.start(args.duration)
-    elif args.pomo_command == "stop":
-        pomo.stop()
-    elif args.pomo_command == "status":
-        pomo.status()
-    elif args.pomo_command == "config":
-        pomo.show_config()
-    else:
-        display.error(f"Unknown pomodoro command: {args.pomo_command}")
-        return 1
-
-    return 0
-
-
-def _cmd_report(args: argparse.Namespace, display: Display) -> int:
-    """Handle the 'report' command.
-
-    Args:
-        args: Parsed command-line arguments.
-        display: Display utility instance.
-
-    Returns:
-        Exit code.
-    """
-    generator = ReportGenerator()
-
-    try:
-        report = generator.generate(
-            period=args.period,
-            format_type=args.format,
-            project=args.project,
-            from_date=args.from_date,
-            to_date=args.to_date,
-        )
-    except ValueError as e:
-        display.error(str(e))
-        return 1
-
-    if args.output:
-        try:
-            with open(args.output, "w", encoding="utf-8") as f:
-                f.write(report)
-            display.success(f"Report saved to {args.output}")
-        except IOError as e:
-            display.error(f"Failed to write report: {e}")
-            return 1
-    else:
-        print(report)
-
-    return 0
-
-
-def _cmd_analyze(args: argparse.Namespace, display: Display) -> int:
-    """Handle the 'analyze' command.
-
-    Args:
-        args: Parsed command-line arguments.
-        display: Display utility instance.
-
-    Returns:
-        Exit code.
-    """
-    engine = AnalyticsEngine()
-    engine.display_analysis(days=args.days)
-    return 0
-
-
-def _cmd_git(args: argparse.Namespace, display: Display) -> int:
-    """Handle the 'git' command.
-
-    Args:
-        args: Parsed command-line arguments.
-        display: Display utility instance.
-
-    Returns:
-        Exit code.
-    """
-    linker = GitLinker()
-
-    if not args.git_command:
-        display.info("Usage: timeforge git <link|log>")
-        return 1
-
-    if args.git_command == "link":
-        if linker.link_commit(entry_id=args.entry):
-            return 0
-        return 1
-    elif args.git_command == "log":
-        linker.show_git_log()
-        return 0
-    else:
-        display.error(f"Unknown git command: {args.git_command}")
-        return 1
-
-
-def _cmd_config(args: argparse.Namespace, display: Display) -> int:
-    """Handle the 'config' command.
-
-    Args:
-        args: Parsed command-line arguments.
-        display: Display utility instance.
-
-    Returns:
-        Exit code.
-    """
-    config = Config()
-
-    if args.reset:
-        config.reset()
-        display.success("Configuration reset to defaults.")
-        return 0
-
-    if args.list_all:
-        display.header("TimeForge Configuration")
-        all_config = config.get_all()
-        rows = []
-        for key, value in sorted(all_config.items()):
-            rows.append([key, str(value)])
-        display.table(["Key", "Value"], rows)
-        return 0
-
-    if args.key and args.value is not None:
-        # Try to convert numeric values
-        try:
-            typed_value = int(args.value)
-        except ValueError:
-            try:
-                typed_value = float(args.value)
-            except ValueError:
-                typed_value = args.value
-
-        config.set(args.key, typed_value)
-        display.success(f"Set {args.key} = {typed_value}")
-        return 0
-
-    if args.key:
-        value = config.get(args.key)
-        if value is not None:
-            display.info(f"{args.key} = {value}")
-        else:
-            display.error(f"Unknown configuration key: {args.key}")
-            return 1
-        return 0
-
-    # No arguments - show current config
-    display.header("TimeForge Configuration")
-    display.info(f"Config file: {config.config_file}")
-    display.info("Use 'timeforge config --list' to see all settings.")
-    display.info("Use 'timeforge config <key> <value>' to change a setting.")
-    return 0
+            cli.show_stats()
+    
+    elif args.command == "config":
+        config_kwargs = {}
+        if args.work:
+            config_kwargs['work_duration'] = args.work
+        if args.short_break:
+            config_kwargs['short_break'] = args.short_break
+        if args.long_break:
+            config_kwargs['long_break'] = args.long_break
+        if args.sound is not None:
+            config_kwargs['sound_enabled'] = args.sound
+        if args.auto_break is not None:
+            config_kwargs['auto_start_break'] = args.auto_break
+        
+        cli.config_cmd(**config_kwargs)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
