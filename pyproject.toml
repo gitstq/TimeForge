@@ -1,33 +1,84 @@
 [build-system]
-requires = ["setuptools>=45", "wheel"]
+requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "timeforge"
 version = "1.0.0"
-description = "Lightweight terminal time tracking and productivity analysis CLI tool"
+description = "⏰ A powerful terminal time management tool with countdown, stopwatch, and pomodoro features"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.8"
 authors = [
-    {name = "TimeForge"},
+    {name = "TimeForge Team", email = "timeforge@example.com"}
+]
+keywords = [
+    "timer",
+    "countdown",
+    "stopwatch",
+    "pomodoro",
+    "terminal",
+    "cli",
+    "time-management",
+    "productivity",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
     "Intended Audience :: Developers",
+    "Intended Audience :: End Users/Desktop",
     "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business :: Scheduling",
     "Topic :: Utilities",
+]
+dependencies = [
+    "rich>=13.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "black>=23.0.0",
+    "isort>=5.0.0",
+    "mypy>=1.0.0",
+    "flake8>=6.0.0",
 ]
 
 [project.scripts]
 timeforge = "timeforge.cli:main"
 
-[tool.setuptools]
-packages = ["timeforge", "timeforge.core", "timeforge.features", "timeforge.utils"]
+[project.urls]
+Homepage = "https://github.com/gitstq/TimeForge"
+Documentation = "https://github.com/gitstq/TimeForge#readme"
+Repository = "https://github.com/gitstq/TimeForge"
+Issues = "https://github.com/gitstq/TimeForge/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["timeforge*"]
+
+[tool.black]
+line-length = 100
+target-version = ['py38', 'py39', 'py310', 'py311']
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v --cov=timeforge"
